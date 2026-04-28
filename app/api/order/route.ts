@@ -49,6 +49,14 @@ export async function POST(req: NextRequest) {
     createdAt: Date.now(),
   };
 
-  await addOrder(order);
+  try {
+    await addOrder(order);
+  } catch {
+    return NextResponse.json(
+      { error: "Porosia nuk u ruajt. Kontrollo lidhjen me Redis." },
+      { status: 503 },
+    );
+  }
+
   return NextResponse.json({ ok: true, id: order.id });
 }

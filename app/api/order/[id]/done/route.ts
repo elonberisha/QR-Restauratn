@@ -10,6 +10,13 @@ export async function POST(
 ) {
   const { id } = await params;
   if (!id) return NextResponse.json({ error: "ID mungon" }, { status: 400 });
-  const removed = await removeOrder(id);
-  return NextResponse.json({ ok: removed });
+  try {
+    const removed = await removeOrder(id);
+    return NextResponse.json({ ok: removed });
+  } catch {
+    return NextResponse.json(
+      { error: "Porosia nuk u perditesua. Kontrollo Redis." },
+      { status: 503 },
+    );
+  }
 }

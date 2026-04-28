@@ -12,14 +12,21 @@ import {
   Clock,
   Loader2,
   Radio,
+  Database,
+  AlertTriangle,
 } from "lucide-react";
 import type { Order } from "@/lib/types";
+
+type StorageMode = "upstash-redis" | "json-file" | "memory-only" | "redis" | "memory";
 
 export default function BanakuPage() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [now, setNow] = useState(Date.now());
   const [soundOn, setSoundOn] = useState(true);
   const [connected, setConnected] = useState(false);
+  const [storage, setStorage] = useState<StorageMode | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [storeError, setStoreError] = useState<string | null>(null);
   const [doneIds, setDoneIds] = useState<Set<string>>(new Set());
   const knownIds = useRef<Set<string>>(new Set());
   const firstLoad = useRef(true);
@@ -38,6 +45,20 @@ export default function BanakuPage() {
     let es: EventSource | null = null;
     let stopped = false;
     let reopenTimer: ReturnType<typeof setTimeout> | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    function normalizeStorage(value: unknown): StorageMode | null {
+      if (
+        value === "upstash-redis" ||
+        value === "json-file" ||
+        value === "memory-only" ||
+        value === "redis" ||
+        value === "memory"
+      ) {
+        return value;
+      }
+      return null;
+    }
 
     function applyOrders(incoming: Order[]) {
       const incomingIds = new Set(incoming.map((o) => o.id));
@@ -59,19 +80,66 @@ export default function BanakuPage() {
       });
     }
 
+    async function fetchOrders() {
+      try {
+        const res = await fetch(`/api/orders?ts=${Date.now()}`, {
+          cache: "no-store",
+        });
+        const data = (await res.json()) as {
+          orders?: Order[];
+          storage?: StorageMode;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(data.error ?? "Nuk u lexuan porosite");
+        }
+        if (stopped) return;
+        if (Array.isArray(data.orders)) applyOrders(data.orders);
+        const nextStorage = normalizeStorage(data.storage);
+        if (nextStorage) setStorage(nextStorage);
+        setLastSyncAt(Date.now());
+        setStoreError(null);
+      } catch (e) {
+        if (stopped) return;
+        setStoreError(e instanceof Error ? e.message : "Gabim gjate sinkronizimit");
+      }
+    }
+
     function open() {
       if (stopped) return;
       es = new EventSource("/api/stream");
 
-      es.addEventListener("hello", () => setConnected(true));
-      es.addEventListener("orders", (ev: MessageEvent) => {
+      es.addEventListener("hello", (ev: MessageEvent) => {
+        setConnected(true);
         try {
-          const { orders: incoming } = JSON.parse(ev.data) as {
-            orders: Order[];
-          };
-          applyOrders(incoming);
+          const data = JSON.parse(ev.data) as { storage?: StorageMode };
+          const nextStorage = normalizeStorage(data.storage);
+          if (nextStorage) setStorage(nextStorage);
         } catch {
           /* ignore */
+        }
+      });
+      es.addEventListener("orders", (ev: MessageEvent) => {
+        try {
+          const { orders: incoming, storage: incomingStorage } = JSON.parse(ev.data) as {
+            orders: Order[];
+            storage?: StorageMode;
+          };
+          applyOrders(incoming);
+          const nextStorage = normalizeStorage(incomingStorage);
+          if (nextStorage) setStorage(nextStorage);
+          setLastSyncAt(Date.now());
+          setStoreError(null);
+        } catch {
+          /* ignore */
+        }
+      });
+      es.addEventListener("store-error", (ev: MessageEvent) => {
+        try {
+          const data = JSON.parse(ev.data) as { message?: string };
+          setStoreError(data.message ?? "Gabim ne storage");
+        } catch {
+          setStoreError("Gabim ne storage");
         }
       });
       es.addEventListener("bye", () => {
@@ -86,15 +154,19 @@ export default function BanakuPage() {
         // Browser EventSource will normally reconnect on its own, but on some
         // server-close conditions it doesn't. Force reopen after a short delay.
         if (!stopped) {
+          if (reopenTimer) clearTimeout(reopenTimer);
           reopenTimer = setTimeout(open, 1000);
         }
       };
     }
 
     open();
+    fetchOrders();
+    pollTimer = setInterval(fetchOrders, 2_500);
     return () => {
       stopped = true;
       if (reopenTimer) clearTimeout(reopenTimer);
+      if (pollTimer) clearInterval(pollTimer);
       es?.close();
     };
   }, []);
@@ -130,7 +202,9 @@ export default function BanakuPage() {
   async function markDone(id: string) {
     setDoneIds((prev) => new Set(prev).add(id));
     try {
-      await fetch(`/api/order/${id}/done`, { method: "POST" });
+      const res = await fetch(`/api/order/${id}/done`, { method: "POST" });
+      if (!res.ok) throw new Error("Nuk u perditesua porosia");
+      knownIds.current.delete(id);
       // SSE will push the updated list; we also optimistically remove
       setOrders((prev) => prev.filter((o) => o.id !== id));
     } catch {
@@ -156,6 +230,18 @@ export default function BanakuPage() {
     return "";
   }
 
+  const storageIsRedis = storage === "upstash-redis" || storage === "redis";
+  const storageLabel = storageIsRedis
+    ? "Redis"
+    : storage === "json-file"
+    ? "File"
+    : storage === "memory-only" || storage === "memory"
+    ? "Memory"
+    : null;
+  const syncedByPolling =
+    !connected && lastSyncAt !== null && now - lastSyncAt < 8_000;
+  const syncOk = connected || syncedByPolling;
+
   return (
     <main className="min-h-dvh">
       <header className="sticky top-0 z-10 bg-[#0A0A0A]/95 backdrop-blur-md border-b border-[color:var(--color-border)] px-5 py-3.5 flex items-center gap-4 flex-wrap">
@@ -180,6 +266,22 @@ export default function BanakuPage() {
           </h1>
         </div>
         <div className="flex-1" />
+        {storageLabel && (
+          <div
+            className={
+              "flex items-center gap-2 text-xs px-3.5 h-11 rounded-xl card font-semibold " +
+              (storageIsRedis ? "text-[color:var(--color-success)]" : "border-amber-500/50 text-amber-300")
+            }
+            title={storageIsRedis ? "Storage: Redis" : "Storage nuk eshte Redis"}
+          >
+            {storageIsRedis ? (
+              <Database className="w-4 h-4" strokeWidth={2.5} />
+            ) : (
+              <AlertTriangle className="w-4 h-4" strokeWidth={2.5} />
+            )}
+            <span>{storageLabel}</span>
+          </div>
+        )}
         <button
           onClick={() => setSoundOn((s) => !s)}
           className={
@@ -196,15 +298,26 @@ export default function BanakuPage() {
         <div
           className={
             "flex items-center gap-2 text-xs px-3.5 h-11 rounded-xl card font-semibold " +
-            (connected ? "" : "border-red-500/50")
+            (syncOk ? "" : "border-red-500/50")
           }
-          title={connected ? "Stream live (push real-time)" : "Lidhja po rifillon..."}
+          title={
+            connected
+              ? "Stream live"
+              : syncedByPolling
+              ? "Polling backup aktiv"
+              : "Lidhja po rifillon..."
+          }
         >
           {connected ? (
             <>
               <Radio className="w-4 h-4 text-[color:var(--color-success)] animate-pulse" strokeWidth={2.5} />
               <Wifi className="w-4 h-4 text-[color:var(--color-success)]" strokeWidth={2.5} />
               <span className="text-[color:var(--color-success)]">Live</span>
+            </>
+          ) : syncedByPolling ? (
+            <>
+              <Wifi className="w-4 h-4 text-[color:var(--color-success)]" strokeWidth={2.5} />
+              <span className="text-[color:var(--color-success)]">Sync</span>
             </>
           ) : (
             <>
@@ -223,10 +336,10 @@ export default function BanakuPage() {
             </div>
             <p className="text-lg font-semibold">Asnjë porosi për momentin</p>
             <p className="text-xs mt-2 flex items-center justify-center gap-1.5">
-              {connected ? (
+              {syncOk ? (
                 <>
                   <Radio className="w-3 h-3 animate-pulse text-[color:var(--color-success)]" strokeWidth={2.5} />
-                  Stream live i lidhur
+                  {connected ? "Stream live i lidhur" : "Polling backup aktiv"}
                 </>
               ) : (
                 <>
@@ -235,6 +348,11 @@ export default function BanakuPage() {
                 </>
               )}
             </p>
+            {storeError && (
+              <p className="text-xs mt-3 text-red-400 font-semibold">
+                {storeError}
+              </p>
+            )}
           </div>
         ) : (
           <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">

@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { bus, listOrders, usingRedis } from "@/lib/store";
+import { bus, listOrders, storageBackend } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -8,8 +8,7 @@ export const maxDuration = 60;
 
 const RECONNECT_BEFORE_TIMEOUT_MS = 55_000;
 const HEARTBEAT_MS = 15_000;
-// Cross-instance fallback poll (catches changes happening on other Vercel
-// instances when in production with shared Upstash KV)
+// Fallback poll catches missed bus events and cross-instance Vercel changes.
 const FALLBACK_POLL_MS = 1_500;
 
 export async function GET(req: NextRequest) {
@@ -50,10 +49,12 @@ export async function GET(req: NextRequest) {
             orders.map((o) => `${o.id}@${o.createdAt}`).join(",");
           if (sig !== lastSig) {
             lastSig = sig;
-            send("orders", { orders });
+            send("orders", { orders, storage: storageBackend });
           }
-        } catch {
-          /* swallow */
+        } catch (e) {
+          send("store-error", {
+            message: e instanceof Error ? e.message : "Storage read failed",
+          });
         }
       }
 
@@ -68,7 +69,10 @@ export async function GET(req: NextRequest) {
       }
 
       // Initial state
-      send("hello", { ts: Date.now(), redis: usingRedis });
+      send("hello", {
+        ts: Date.now(),
+        storage: storageBackend,
+      });
       await pushOrders();
 
       // Subscribe to in-process change events (instant push within same instance)
@@ -80,10 +84,7 @@ export async function GET(req: NextRequest) {
         safeEnqueue(enc.encode(`: ping ${Date.now()}\n\n`));
       }, HEARTBEAT_MS);
 
-      // Cross-instance fallback (only meaningful with Redis)
-      if (usingRedis) {
-        fallback = setInterval(() => pushOrders(), FALLBACK_POLL_MS);
-      }
+      fallback = setInterval(() => pushOrders(), FALLBACK_POLL_MS);
 
       // Close before Vercel timeout so EventSource reconnects cleanly
       endTimer = setTimeout(() => {

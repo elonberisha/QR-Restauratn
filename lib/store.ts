@@ -11,14 +11,50 @@ const HASH_KEY = "enisi:orders";
 // Priority: Upstash Redis (prod) → JSON file (dev / writable serverless tmp)
 // → in-memory only.
 
-const hasUpstash =
-  !!process.env.KV_REST_API_URL && !!process.env.KV_REST_API_TOKEN;
+// Vercel/Upstash can expose REST credentials under different names. Pick a
+// complete URL/token pair instead of mixing a URL from one integration with a
+// token from another.
+const REDIS_ENV_CANDIDATES = [
+  {
+    source: "vercel-kv",
+    url: process.env.KV_REST_API_URL,
+    token: process.env.KV_REST_API_TOKEN,
+  },
+  {
+    source: "upstash-redis",
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  },
+  {
+    source: "redis-rest",
+    url: process.env.REDIS_REST_API_URL,
+    token: process.env.REDIS_REST_API_TOKEN,
+  },
+] as const;
 
-const redis = hasUpstash
-  ? new Redis({
-      url: process.env.KV_REST_API_URL!,
-      token: process.env.KV_REST_API_TOKEN!,
-    })
+type RedisConfig = {
+  source: string;
+  url: string;
+  token: string;
+};
+
+const redisConfig = REDIS_ENV_CANDIDATES.reduce<RedisConfig | null>(
+  (found, candidate) =>
+    found ??
+    (candidate.url && candidate.token
+      ? {
+          source: candidate.source,
+          url: candidate.url,
+          token: candidate.token,
+        }
+      : null),
+  null,
+);
+
+const hasUpstash = redisConfig !== null;
+
+const redis = redisConfig
+  ? new Redis({ url: redisConfig.url, token: redisConfig.token })
   : null;
 
 // JSON file location:
@@ -139,3 +175,25 @@ export async function removeOrder(id: string): Promise<boolean> {
 
 export const usingRedis = hasUpstash;
 export const usingJsonFile = !hasUpstash && JSON_PATH !== null;
+export const redisEnvSource = redisConfig?.source ?? null;
+export const storageBackend = usingRedis
+  ? "upstash-redis"
+  : usingJsonFile
+  ? "json-file"
+  : "memory-only";
+
+export function getStorageDiagnostics() {
+  return {
+    storage: storageBackend,
+    redisEnvSource,
+    env: {
+      hasKvUrl: !!process.env.KV_REST_API_URL,
+      hasKvToken: !!process.env.KV_REST_API_TOKEN,
+      hasUpstashUrl: !!process.env.UPSTASH_REDIS_REST_URL,
+      hasUpstashToken: !!process.env.UPSTASH_REDIS_REST_TOKEN,
+      hasRedisRestUrl: !!process.env.REDIS_REST_API_URL,
+      hasRedisRestToken: !!process.env.REDIS_REST_API_TOKEN,
+      isVercel: !!process.env.VERCEL,
+    },
+  };
+}
