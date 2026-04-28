@@ -17,7 +17,13 @@ import {
 } from "lucide-react";
 import type { Order } from "@/lib/types";
 
-type StorageMode = "upstash-redis" | "json-file" | "memory-only" | "redis" | "memory";
+type StorageMode =
+  | "upstash-redis"
+  | "redis-url"
+  | "json-file"
+  | "memory-only"
+  | "redis"
+  | "memory";
 
 export default function BanakuPage() {
   const [orders, setOrders] = useState<Order[]>([]);
@@ -50,6 +56,7 @@ export default function BanakuPage() {
     function normalizeStorage(value: unknown): StorageMode | null {
       if (
         value === "upstash-redis" ||
+        value === "redis-url" ||
         value === "json-file" ||
         value === "memory-only" ||
         value === "redis" ||
@@ -230,7 +237,8 @@ export default function BanakuPage() {
     return "";
   }
 
-  const storageIsRedis = storage === "upstash-redis" || storage === "redis";
+  const storageIsRedis =
+    storage === "upstash-redis" || storage === "redis-url" || storage === "redis";
   const storageLabel = storageIsRedis
     ? "Redis"
     : storage === "json-file"

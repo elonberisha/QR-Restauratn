@@ -1,4 +1,5 @@
-import { Redis } from "@upstash/redis";
+import { Redis as UpstashRedis } from "@upstash/redis";
+import { createClient } from "redis";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
@@ -51,10 +52,13 @@ const redisConfig = REDIS_ENV_CANDIDATES.reduce<RedisConfig | null>(
   null,
 );
 
-const hasUpstash = redisConfig !== null;
+const TCP_REDIS_URL = process.env.REDIS_URL ?? "";
 
-const redis = redisConfig
-  ? new Redis({ url: redisConfig.url, token: redisConfig.token })
+const hasUpstash = redisConfig !== null;
+const hasTcpRedis = !hasUpstash && TCP_REDIS_URL.length > 0;
+
+const upstashRedis = redisConfig
+  ? new UpstashRedis({ url: redisConfig.url, token: redisConfig.token })
   : null;
 
 // JSON file location:
@@ -62,7 +66,7 @@ const redis = redisConfig
 //  - On Vercel without Upstash:  /tmp/enisi-orders.json (ephemeral but
 //    survives same-instance reuse so refreshes don't lose orders)
 function pickJsonPath(): string | null {
-  if (hasUpstash) return null;
+  if (hasUpstash || hasTcpRedis) return null;
   try {
     if (process.env.VERCEL) {
       return path.join(os.tmpdir(), "enisi-orders.json");
@@ -81,6 +85,8 @@ type GlobalState = {
   bus?: EventEmitter;
   jsonLoaded?: boolean;
   saveTimer?: ReturnType<typeof setTimeout> | null;
+  tcpRedis?: ReturnType<typeof createClient>;
+  tcpRedisConnect?: Promise<ReturnType<typeof createClient>>;
 };
 const g = globalThis as unknown as GlobalState;
 if (!g.mem) g.mem = new Map<string, Order>();
@@ -90,6 +96,35 @@ if (!g.bus) {
 }
 const mem = g.mem;
 export const bus = g.bus;
+
+async function getTcpRedis() {
+  if (!TCP_REDIS_URL) {
+    throw new Error("REDIS_URL is missing");
+  }
+  if (g.tcpRedis?.isOpen) {
+    return g.tcpRedis;
+  }
+  if (g.tcpRedisConnect) {
+    return g.tcpRedisConnect;
+  }
+
+  const client = createClient({ url: TCP_REDIS_URL });
+  client.on("error", (error) => {
+    console.error("Redis connection error", error);
+  });
+
+  g.tcpRedis = client;
+  g.tcpRedisConnect = client
+    .connect()
+    .then(() => client)
+    .catch((error) => {
+      g.tcpRedis = undefined;
+      g.tcpRedisConnect = undefined;
+      throw error;
+    });
+
+  return g.tcpRedisConnect;
+}
 
 // ── JSON file helpers ───────────────────────────────────────────────────────
 function loadFromDisk() {
@@ -132,8 +167,11 @@ loadFromDisk();
 
 // ── Public API ──────────────────────────────────────────────────────────────
 export async function addOrder(order: Order): Promise<void> {
-  if (redis) {
-    await redis.hset(HASH_KEY, { [order.id]: JSON.stringify(order) });
+  if (upstashRedis) {
+    await upstashRedis.hset(HASH_KEY, { [order.id]: JSON.stringify(order) });
+  } else if (hasTcpRedis) {
+    const redis = await getTcpRedis();
+    await redis.hSet(HASH_KEY, order.id, JSON.stringify(order));
   } else {
     mem.set(order.id, order);
     scheduleSave();
@@ -143,8 +181,19 @@ export async function addOrder(order: Order): Promise<void> {
 
 export async function listOrders(): Promise<Order[]> {
   let orders: Order[] = [];
-  if (redis) {
-    const raw = (await redis.hvals(HASH_KEY)) as unknown[];
+  if (upstashRedis) {
+    const raw = (await upstashRedis.hvals(HASH_KEY)) as unknown[];
+    orders = raw
+      .map((v) => {
+        if (typeof v === "string") {
+          try { return JSON.parse(v) as Order; } catch { return null; }
+        }
+        return v as Order;
+      })
+      .filter((x): x is Order => x !== null);
+  } else if (hasTcpRedis) {
+    const redis = await getTcpRedis();
+    const raw = await redis.hVals(HASH_KEY);
     orders = raw
       .map((v) => {
         if (typeof v === "string") {
@@ -162,8 +211,12 @@ export async function listOrders(): Promise<Order[]> {
 
 export async function removeOrder(id: string): Promise<boolean> {
   let removed = false;
-  if (redis) {
-    const n = await redis.hdel(HASH_KEY, id);
+  if (upstashRedis) {
+    const n = await upstashRedis.hdel(HASH_KEY, id);
+    removed = n > 0;
+  } else if (hasTcpRedis) {
+    const redis = await getTcpRedis();
+    const n = await redis.hDel(HASH_KEY, id);
     removed = n > 0;
   } else {
     removed = mem.delete(id);
@@ -173,11 +226,13 @@ export async function removeOrder(id: string): Promise<boolean> {
   return removed;
 }
 
-export const usingRedis = hasUpstash;
-export const usingJsonFile = !hasUpstash && JSON_PATH !== null;
-export const redisEnvSource = redisConfig?.source ?? null;
+export const usingRedis = hasUpstash || hasTcpRedis;
+export const usingJsonFile = !usingRedis && JSON_PATH !== null;
+export const redisEnvSource = redisConfig?.source ?? (hasTcpRedis ? "redis-url" : null);
 export const storageBackend = usingRedis
-  ? "upstash-redis"
+  ? hasTcpRedis
+    ? "redis-url"
+    : "upstash-redis"
   : usingJsonFile
   ? "json-file"
   : "memory-only";
@@ -193,6 +248,7 @@ export function getStorageDiagnostics() {
       hasUpstashToken: !!process.env.UPSTASH_REDIS_REST_TOKEN,
       hasRedisRestUrl: !!process.env.REDIS_REST_API_URL,
       hasRedisRestToken: !!process.env.REDIS_REST_API_TOKEN,
+      hasRedisUrl: !!process.env.REDIS_URL,
       isVercel: !!process.env.VERCEL,
     },
   };
