@@ -32,16 +32,45 @@ export default function AdminPage() {
   const [showPreviews, setShowPreviews] = useState(true);
   const [generating, setGenerating] = useState(true);
 
-  // Detect origin from the current browser location once on mount
+  // Detect origin from the current browser location once on mount.
+  // Restore the last-used table count from the URL or localStorage so
+  // refreshing the admin page never loses the value the user picked.
   useEffect(() => {
     const auto = window.location.origin;
     setDetectedOrigin(auto);
     setOrigin(auto);
     setDraftOrigin(auto);
+
     const params = new URLSearchParams(window.location.search);
-    const n = Number(params.get("n"));
-    if (Number.isInteger(n) && n >= 1 && n <= 99) setCount(n);
+    const fromUrl = Number(params.get("n"));
+    if (Number.isInteger(fromUrl) && fromUrl >= 1 && fromUrl <= 99) {
+      setCount(fromUrl);
+      return;
+    }
+    try {
+      const stored = Number(localStorage.getItem("enisi:tableCount"));
+      if (Number.isInteger(stored) && stored >= 1 && stored <= 99) {
+        setCount(stored);
+      }
+    } catch {
+      /* localStorage may be unavailable */
+    }
   }, []);
+
+  // Persist count to URL + localStorage so refreshes preserve it.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      localStorage.setItem("enisi:tableCount", String(count));
+    } catch {
+      /* ignore */
+    }
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("n") !== String(count)) {
+      url.searchParams.set("n", String(count));
+      window.history.replaceState(null, "", url.toString());
+    }
+  }, [count]);
 
   const tables = useMemo(
     () => Array.from({ length: count }, (_, i) => i + 1),
@@ -296,6 +325,12 @@ export default function AdminPage() {
                 Shkarko PDF për të gjitha
               </strong>{" "}
               gjeneron një file me {count} faqe (një faqe për secilën tavolinë).
+            </p>
+            <p className="text-[10px] text-[color:var(--color-muted)] mt-2 leading-relaxed border-t border-[color:var(--color-border)] pt-2">
+              <strong className="text-[color:var(--color-gold)]">Vërejtje:</strong>{" "}
+              Numri i tavolinave këtu shërben vetëm për sa QR të gjeneroj. Çdo
+              tavolinë (1–99) funksionon <em>përjetësisht</em> sapo printohet
+              QR-ja e saj — porositë ruhen pavarësisht sa shfaqen këtu.
             </p>
           </div>
           <button
