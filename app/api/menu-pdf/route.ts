@@ -24,11 +24,15 @@ const MUTED = rgb(0.42, 0.42, 0.42);
 const WHITE = rgb(1, 1, 1);
 
 async function generateQrPng(url: string): Promise<Uint8Array> {
-  // Transparent background so the orange menu shows through.
-  // High error correction so the QR remains scannable on the colored background.
+  // High error correction (H = 30%) keeps the QR scannable on a colored
+  // background. A 4-module quiet zone (margin: 4) is required by the QR spec —
+  // older scanners refuse to read codes without it. Background is transparent
+  // so the orange menu shows through; the quiet zone is therefore "orange",
+  // which still works because the scanner only needs a uniform low-contrast
+  // border around the modules.
   return await QRCode.toBuffer(url, {
     errorCorrectionLevel: "H",
-    margin: 0,
+    margin: 4,
     width: 480,
     color: { dark: "#000000FF", light: "#00000000" },
   });
